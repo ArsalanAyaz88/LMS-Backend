@@ -7,8 +7,10 @@ from ..models.profile import Profile
 from ..schemas.profile import ProfileRead, ProfileUpdate
 from ..db.session import get_db
 from ..utils.dependencies import get_current_user
-from ..utils.file import save_upload_and_get_url
 from fastapi.logger import logger
+import cloudinary
+import cloudinary.uploader
+from ..config import cloudinary_config
 
 router = APIRouter(tags=["Profile"])
  
@@ -64,21 +66,31 @@ async def upload_avatar(
     session: Session = Depends(get_db)
 ):
     try:
-        # Upload file to B2
-        url = await save_upload_and_get_url(file, folder="avatars")
-        
-        # Update profile with new avatar URL
+        folder_name = os.getenv("CLOUDINARY_FOLDER_NAME", "LMS")
+        folder = f"{folder_name}/avatars"
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            folder=folder,
+            public_id=str(user.id),
+            overwrite=True,
+            resource_type="image"
+        )
+        secure_url = upload_result.get('secure_url')
+        if not secure_url:
+            raise HTTPException(status_code=500, detail="Cloudinary upload failed: No URL returned.")
+
         profile = session.exec(select(Profile).where(Profile.user_id == user.id)).first()
         if not profile:
             raise HTTPException(status_code=404, detail="Profile not found")
-            
-        profile.avatar_url = url
+
+        profile.avatar_url = secure_url
         session.add(profile)
         session.commit()
         session.refresh(profile)
-        
+
         return {
-            "message": "Profile avatar updated successfully"
+            "message": "Profile avatar updated successfully",
+            "avatar_url": profile.avatar_url
         }
         
     except Exception as e:
