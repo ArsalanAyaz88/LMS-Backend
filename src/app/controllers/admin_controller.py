@@ -16,6 +16,9 @@ from src.app.controllers.course_controller import optimize_video_url_simple
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, UploadFile, File, Form
+import cloudinary
+import cloudinary.uploader
+from src.app.config import cloudinary_config
 
 # Add MediaConvert client
 mediaconvert_client = boto3.client('mediaconvert', region_name='us-east-1') # Replace with your region if different
@@ -231,7 +234,7 @@ async def upload_image(
     admin: User = Depends(get_current_admin_user)
 ):
     """
-    Uploads an image to AWS S3 and returns the URL.
+    Uploads an image to Cloudinary and returns the URL.
     This endpoint requires admin authentication.
     """
     if not file.content_type.startswith("image/"):
@@ -241,8 +244,19 @@ async def upload_image(
         )
     
     try:
-        image_url = await save_upload_and_get_url(file=file, folder="course_thumbnails")
-        return {"url": image_url}
+        folder_name = os.getenv("CLOUDINARY_FOLDER_NAME", "LMS")
+        folder = f"{folder_name}/course_thumbnails"
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            folder=folder,
+            public_id=str(uuid.uuid4()),
+            overwrite=True,
+            resource_type="image"
+        )
+        secure_url = upload_result.get('secure_url')
+        if not secure_url:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Cloudinary upload failed: No URL returned.")
+        return {"url": secure_url}
     except Exception as e:
         logging.error(f"Error uploading image: {e}")
         raise HTTPException(
@@ -251,13 +265,13 @@ async def upload_image(
         )
 
 
-
 @router.post("/courses", status_code=status.HTTP_201_CREATED, response_model=AdminCourseDetail)
 async def create_course(
     title: str = Form(...),
     description: str = Form(...),
     price: float = Form(...),
     thumbnail_url: Optional[str] = Form(None),
+    thumbnail: Optional[UploadFile] = File(None),
     difficulty_level: Optional[str] = Form(None),
     outcomes: Optional[str] = Form(None),
     prerequisites: Optional[str] = Form(None),
@@ -278,12 +292,28 @@ async def create_course(
         if not session_admin:
             raise HTTPException(status_code=404, detail="Admin user not found in session")
 
+        uploaded_thumbnail_url = None
+        if not thumbnail_url and thumbnail is not None:
+            if not thumbnail.content_type.startswith("image/"):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Only images are allowed.")
+            folder_name = os.getenv("CLOUDINARY_FOLDER_NAME", "LMS")
+            folder = f"{folder_name}/course_thumbnails"
+            upload_result = cloudinary.uploader.upload(
+                thumbnail.file,
+                folder=folder,
+                public_id=f"{uuid.uuid4().hex}_thumbnail",
+                overwrite=True,
+                resource_type="image"
+            )
+            uploaded_thumbnail_url = upload_result.get('secure_url')
+        final_thumbnail_url = thumbnail_url or uploaded_thumbnail_url
+
         # Create the course instance
         course = Course(
             title=title,
             description=description,
             price=price,
-            thumbnail_url=thumbnail_url,
+            thumbnail_url=final_thumbnail_url,
             difficulty_level=difficulty_level,
             outcomes=outcomes or "",
             prerequisites=prerequisites or "",
