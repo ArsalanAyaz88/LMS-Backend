@@ -9,7 +9,7 @@ from typing import List, Optional
 import traceback
 import subprocess
 import shutil
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from src.app.controllers.course_controller import optimize_video_url_simple
 
 # Third-party Imports
@@ -354,8 +354,9 @@ async def create_course(
 
 
 class SignatureRequest(BaseModel):
-    content_type: str
-    file_name: str
+    content_type: Optional[str] = None
+    file_name: Optional[str] = None
+    youtube_url: Optional[str] = None
 
 @router.post("/generate-video-upload-signature", response_model=dict)
 async def generate_video_upload_signature(
@@ -363,16 +364,58 @@ async def generate_video_upload_signature(
     admin: User = Depends(get_current_admin_user)
 ):
     """
-    Generates a pre-signed URL for a direct video upload to AWS S3, 
-    using the Content-Type provided by the client.
+    Generate upload info for course videos.
+    - If `youtube_url` is provided, validate and return an embeddable URL.
+    - Otherwise, return an AWS S3 presigned URL for direct upload.
     """
-    logging.info(f"--- Generating video upload signature for content_type: {request_data.content_type} ---")
     try:
+        # 1) YouTube flow
+        if request_data.youtube_url:
+            yt_url = request_data.youtube_url.strip()
+            parsed = urlparse(yt_url)
+            netloc = parsed.netloc.lower()
+
+            def _extract_youtube_id(u: str) -> Optional[str]:
+                p = urlparse(u)
+                host = p.netloc.lower()
+                if 'youtu.be' in host:
+                    vid = p.path.lstrip('/')
+                    return vid.split('/')[0].split('?')[0]
+                if 'youtube.com' in host:
+                    # /watch?v=ID or /embed/ID or /shorts/ID
+                    if p.path.startswith('/embed/'):
+                        parts = p.path.split('/')
+                        return parts[2] if len(parts) > 2 else None
+                    if p.path.startswith('/shorts/'):
+                        parts = p.path.split('/')
+                        return parts[2] if len(parts) > 2 else None
+                    qs = parse_qs(p.query)
+                    vals = qs.get('v', [])
+                    if vals:
+                        return vals[0]
+                return None
+
+            video_id = _extract_youtube_id(yt_url)
+            if not video_id:
+                raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+            embed_url = f"https://www.youtube.com/embed/{video_id}"
+            logging.info(f"Generated YouTube embed URL for video ID {video_id}")
+            return {
+                "provider": "youtube",
+                "presigned_url": None,
+                "file_key": f"youtube:{video_id}",
+                "bucket": None,
+                "expires_in": 0,
+                "video_url": embed_url,
+                "video_id": video_id,
+            }
+
+        # 2) AWS S3 flow (default)
         if s3_client is None:
             logging.error("S3 client is not configured.")
             raise HTTPException(status_code=500, detail="S3 client is not configured")
 
-        content_type = request_data.content_type
+        content_type = (request_data.content_type or '').strip()
         if not content_type.startswith('video/'):
             logging.warning(f"Invalid content type received: {content_type}")
             raise HTTPException(status_code=400, detail="Invalid content type. Only video files are allowed.")
@@ -382,7 +425,6 @@ async def generate_video_upload_signature(
         file_key = f"videos/{timestamp}_{uuid.uuid4().hex}"
         logging.info(f"Generated S3 file key: {file_key}")
 
-        # Generate pre-signed URL for PUT operation (upload)
         presigned_url = s3_client.generate_presigned_url(
             'put_object',
             Params={
@@ -392,20 +434,23 @@ async def generate_video_upload_signature(
             },
             ExpiresIn=7200  # URL expires in 2 hours
         )
-        
+
         logging.info(f"Successfully generated pre-signed URL for {file_key}")
         return {
+            "provider": "aws",
             "presigned_url": presigned_url,
             "file_key": file_key,
             "bucket": S3_BUCKET_NAME,
             "expires_in": 7200
         }
+    except HTTPException:
+        raise
     except Exception as e:
         tb_str = traceback.format_exc()
-        logging.error(f"Error generating video upload signature: {e}\nTraceback:\n{tb_str}")
+        logging.error(f"Error generating upload info: {e}\nTraceback:\n{tb_str}")
         raise HTTPException(
             status_code=500,
-            detail=f"Could not generate upload signature: {e}"
+            detail=f"Could not generate upload info: {e}"
         )
 
 class VideoCreateAdmin(BaseModel):
@@ -617,7 +662,8 @@ def delete_video(
     admin: User = Depends(get_current_admin_user)
 ):
     """
-    Delete a video from the database and the corresponding file from S3.
+    Delete a video from the database and, if applicable, the corresponding file from S3.
+    Skips S3 deletion for YouTube videos.
     """
     logging.info(f"[ADMIN] Attempting to delete video with ID: {video_id}")
 
@@ -626,7 +672,15 @@ def delete_video(
         logging.warning(f"[ADMIN] Video not found for deletion: {video_id}")
         raise HTTPException(status_code=404, detail="Video not found")
 
-    s3_file_key = db_video.public_id  # Assuming public_id stores the S3 file key
+    s3_file_key = db_video.public_id  # For AWS uploads this stores the S3 file key
+    is_youtube = False
+    if db_video.cloudinary_url:
+        lower_url = db_video.cloudinary_url.lower()
+        is_youtube = (
+            "youtube.com" in lower_url or
+            "youtu.be" in lower_url or
+            "youtube-nocookie.com" in lower_url
+        )
 
     try:
         # Step 1: Delete the database record
@@ -635,8 +689,8 @@ def delete_video(
         db.commit()
         logging.info(f"[ADMIN] Successfully deleted video from DB: {video_id}")
 
-        # Step 2: Delete the file from S3
-        if s3_file_key and s3_client:
+        # Step 2: Delete the file from S3 (only for non-YouTube videos)
+        if s3_file_key and s3_client and not is_youtube:
             try:
                 logging.info(f"[ADMIN] Deleting file from S3 with key: {s3_file_key}")
                 s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_file_key)
