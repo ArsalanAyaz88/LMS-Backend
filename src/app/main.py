@@ -48,7 +48,10 @@ app = FastAPI(
 # ─── Middlewares ───────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.sabiryultrasound.com","https://suti.vercel.app","http://localhost:8080"],
+    allow_origins=[
+        "http://localhost:8080",
+        "https://lms-frontend-rho-one.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
